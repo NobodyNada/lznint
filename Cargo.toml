@@ -13,6 +13,3 @@ edition = "2021"
 
 [dependencies]
 thiserror = "1.0.37"
-
-[profile.test]
-opt-level = 3
