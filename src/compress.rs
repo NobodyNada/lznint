@@ -1,24 +1,35 @@
+use std::collections::HashMap;
+
 use crate::{Command, Reference};
 
 /// Compresses the provided data.
 pub fn compress(src: &[u8]) -> Vec<u8> {
     let mut dst = Vec::new();
 
+    let mut cache = BackreferenceCache::default();
+
     let mut i = 0;
     let mut prev_copy = Vec::new();
     while i < src.len() {
-        let best = find_best(src, i);
+        let best = find_best(src, i, &mut cache);
         // The new command has to save at least 2 bytes to be worthwhile over a copy
         if best.len() >= best.cost() + 2 {
             if !prev_copy.is_empty() {
                 Command::Copy(&prev_copy[..]).write(&mut dst);
-                prev_copy = Vec::new();
+                prev_copy.clear();
             }
             best.write(&mut dst);
+            cache.fill(src, i, i + best.len());
             i += best.len();
         } else {
             prev_copy.push(src[i]);
+            cache.fill(src, i, i + 1);
             i += 1;
+
+            if prev_copy.len() == Command::MAX_LEN {
+                Command::Copy(&prev_copy[..]).write(&mut dst);
+                prev_copy.clear();
+            }
         }
     }
 
@@ -31,8 +42,8 @@ pub fn compress(src: &[u8]) -> Vec<u8> {
     dst
 }
 
-fn find_best(src: &[u8], i: usize) -> Command {
-    let candidates = [
+fn find_best<'a>(src: &'a [u8], i: usize, cache: &mut BackreferenceCache) -> Command<'a> {
+    let mut candidates = [
         // byte fill
         Some(Command::ByteFill {
             data: src[i],
@@ -73,76 +84,32 @@ fn find_best(src: &[u8], i: usize) -> Command {
                 Command::MAX_LEN,
             ),
         }),
-        find_best_backreference(src, i),
     ];
+    // We want to prioritize earlier candidates in case of ties, but max_by prioritizes last.
+    // So reverse the order:
+    candidates.reverse();
 
-    candidates
+    let best_non_backreference = candidates
         .into_iter()
         .flatten()
-        .max_by(|a, b| {
-            let a = a.len() as f32 / a.cost() as f32;
-            let b = b.len() as f32 / b.cost() as f32;
-            a.partial_cmp(&b).unwrap()
-        })
-        .unwrap()
-}
+        .max_by(|a, b| a.bytes_per_cost().total_cmp(&b.bytes_per_cost()))
+        .unwrap();
 
-fn find_best_backreference(src: &[u8], i: usize) -> Option<Command> {
-    let mut best_relative = (0, false, 0); // a (j, inv, len) pair
-    let farthest_relative = i - std::cmp::min(i, 255);
-    for j in farthest_relative..i {
-        let (inv, mut len) = backreference_at(src, i, j);
-        if inv {
-            // Maximum length for an inverted relative backreference is 0x300
-            // due to collision with stop command
-            len = len.min(0x300);
-        }
-        // if all else is equal, non-inverted relative matches save a byte (because relative
-        // inverted can only be encoded as an extended command)
-        if len > best_relative.2 || len == best_relative.2 && !inv && best_relative.1 {
-            best_relative = (j, inv, len);
-        }
+    // If we can get a max-length command without needing a backreference,
+    // skip the expensive backreference search.
+    if best_non_backreference.len() == Command::MAX_LEN {
+        return best_non_backreference;
     }
 
-    let mut best_absolute = (0, false, 0); // a (j, inv, len) pair
-    for j in 0..std::cmp::min(farthest_relative, (u16::MAX as usize) + 1) {
-        let (inv, len) = backreference_at(src, i, j);
-        if len > best_absolute.2 {
-            best_absolute = (j, inv, len);
-        }
+    let best_backreference = cache.lookup(src, i);
+    if best_backreference
+        .as_ref()
+        .is_some_and(|b| b.bytes_per_cost() > best_non_backreference.bytes_per_cost())
+    {
+        best_backreference.unwrap()
+    } else {
+        best_non_backreference
     }
-
-    match (best_relative, best_absolute) {
-        // No match found
-        ((_, _, 0), (_, _, 0)) => None,
-
-        // Relative match is best
-        ((j, invert, len), abs) if len >= abs.2 => Some(Command::Backreference {
-            src: Reference::Relative((i - j).try_into().unwrap()),
-            invert,
-            len,
-        }),
-
-        // Absolute is best
-        (_, (j, invert, len)) => Some(Command::Backreference {
-            src: Reference::Absolute(j.try_into().unwrap()),
-            invert,
-            len,
-        }),
-    }
-}
-
-fn backreference_at(src: &[u8], i: usize, j: usize) -> (bool, usize) {
-    for invert in [false, true] {
-        let len = std::iter::zip(src[i..].iter().copied(), src[j..].iter().copied())
-            .take_while(|(a, b)| *a == if invert { !b } else { *b })
-            .count();
-        let len = std::cmp::min(len, Command::MAX_LEN);
-        if len > 0 {
-            return (invert, len);
-        }
-    }
-    (false, 0)
 }
 
 impl Command<'_> {
@@ -192,6 +159,10 @@ impl Command<'_> {
         }
     }
 
+    fn bytes_per_cost(&self) -> f32 {
+        self.len() as f32 / self.cost() as f32
+    }
+
     fn write(&self, dst: &mut Vec<u8>) {
         fn _write(cmd: u8, len: usize, data: &[u8], dst: &mut Vec<u8>) {
             let len = len - 1;
@@ -227,5 +198,118 @@ impl Command<'_> {
 
             Command::Stop => dst.push(0xFF),
         };
+    }
+}
+
+impl Reference {
+    fn try_relative(src: usize, dst: usize) -> Option<Reference> {
+        let distance = u8::try_from(dst - src).ok()?;
+        Some(Reference::Relative(distance))
+    }
+
+    fn try_absolute(src: usize) -> Option<Reference> {
+        Some(Reference::Absolute(u16::try_from(src).ok()?))
+    }
+}
+
+const PREFIX_LEN: usize = 3;
+#[derive(Default, Debug)]
+/// A cache mapping prefixes to offsets where we've seen that prefix.
+struct BackreferenceCache(HashMap<[u8; PREFIX_LEN], Vec<usize>>);
+
+impl BackreferenceCache {
+    /// Searches for a backreference that matches the destination position.
+    fn lookup<'a>(&mut self, data: &'a [u8], dst: usize) -> Option<Command<'a>> {
+        if dst > (data.len() - PREFIX_LEN) {
+            return None;
+        }
+
+        let non_inv = self.lookup_inv(data, dst, false);
+        let inv = self.lookup_inv(data, dst, true);
+
+        [non_inv, inv]
+            .into_iter()
+            .flatten()
+            .max_by(|a, b| a.bytes_per_cost().total_cmp(&b.bytes_per_cost()))
+    }
+
+    fn fill(&mut self, data: &[u8], from: usize, to: usize) {
+        for i in from..(to.min(data.len() - PREFIX_LEN)) {
+            let prefix: [u8; PREFIX_LEN] = data[i..(i + PREFIX_LEN)].try_into().unwrap();
+            self.0.entry(prefix).or_default().push(i);
+        }
+    }
+
+    fn lookup_inv<'a>(&self, data: &'a [u8], dst: usize, invert: bool) -> Option<Command<'a>> {
+        // Find everywhere we've seen this prefix before.
+        let prefix = <[u8; PREFIX_LEN]>::try_from(&data[dst..(dst + PREFIX_LEN)])
+            .unwrap()
+            .map(|b| if invert { !b } else { b });
+
+        let matches = self.0.get(&prefix);
+        let matches = matches
+            .iter()
+            .flat_map(|v| v.iter())
+            .flat_map(|&src| Self::get_match(data, src, dst, invert));
+
+        let mut best = None;
+        // Find the best match.
+        for m in matches {
+            // Bail out early if we find a max-length backreference.
+            if m.len() == Command::MAX_LEN {
+                return Some(m);
+            }
+
+            if best
+                .as_ref()
+                .is_none_or(|b: &Command| m.bytes_per_cost() > b.bytes_per_cost())
+            {
+                best = Some(m);
+            }
+        }
+        best
+    }
+
+    fn get_match<'a>(data: &'a [u8], src: usize, dst: usize, invert: bool) -> Option<Command<'a>> {
+        debug_assert!(data[dst..(dst + PREFIX_LEN)]
+            .iter()
+            .copied()
+            .eq(data[src..(src + PREFIX_LEN)]
+                .iter()
+                .map(|b| if invert { !b } else { *b })));
+
+        let mut len = std::iter::zip(
+            data[dst + 3..].iter().copied(),
+            data[src + 3..].iter().copied(),
+        )
+        .take_while(|(a, b)| *a == if invert { !b } else { *b })
+        .take(Command::MAX_LEN - PREFIX_LEN)
+        .count()
+            + PREFIX_LEN;
+
+        let reference = if let Some(relative) = Reference::try_relative(src, dst) {
+            if invert && len > 0x300 {
+                // A relative inverted match has a shorter max length
+                // due to collision with the stop command.
+                // If we hit that limit, try encoding as absolute.
+                if let Some(absolute) = Reference::try_absolute(src) {
+                    Some(absolute)
+                } else {
+                    // If that fails, just truncate.
+                    len = 0x300;
+                    Some(relative)
+                }
+            } else {
+                Some(relative)
+            }
+        } else {
+            Reference::try_absolute(src)
+        };
+
+        Some(Command::Backreference {
+            src: reference?,
+            invert,
+            len,
+        })
     }
 }

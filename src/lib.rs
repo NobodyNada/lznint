@@ -115,10 +115,7 @@ mod test {
             .into_iter()
             .chain([!1, !2, !3, !4, 1, 2, 3, 4].into_iter().cycle().take(0x400))
             .collect::<Vec<u8>>();
-        assert_eq!(
-            compress(&tricky),
-            [0x63, 1, 0xFE, 0xFF, 0x4, 0xF8, 0xFF, 0xF8, 0xFF]
-        );
+        assert_eq!(compress(&tricky), [0x63, 1, 0xF7, 0xFF, 0, 0, 0xFF]);
 
         // create a 512-byte-long non-compressible sequence
         let seq = || {
